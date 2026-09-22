@@ -1,0 +1,29 @@
+# Gradle / Android build output
+build/
+.gradle/
+.kotlin/
+local.properties
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Local tooling (phone/host specific) and its output
+out/
+*.mp4
+build.sh
+smoke.py
+setparam.py
+capture_transition.py
+make_gif.py
+__pycache__/
+
+# Keep the README media
+!docs/*.gif
