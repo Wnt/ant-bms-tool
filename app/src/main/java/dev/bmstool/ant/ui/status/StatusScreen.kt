@@ -219,9 +219,10 @@ private fun BigMono(value: String, unit: String, color: Color = MaterialTheme.co
 
 @Composable
 private fun currentNote(s: BmsStatus): Pair<String, Color> = when {
+    // MOS state first: after a trip the current takes a second to decay, and "CHARGING" would lag
+    s.chargeMosState == 2 -> "Charge paused · #${s.maxCellIndex} full" to Amber
     s.isCharging -> "CHARGING" to Green
     s.isDischarging -> "DISCHARGING" to Blue
-    s.chargeMosState == 2 -> "Charge paused · #${s.maxCellIndex} full" to Amber
     s.chargeMosState == 4 -> "Battery full" to Green
     s.chargeMosState == 1 && s.dischargeMosState == 1 -> "idle" to dim()
     s.chargeMosState != 1 -> "Charge: ${s.chargeMosText}" to Amber
