@@ -17,9 +17,14 @@ class CurrentHistory(private val windowMs: Long = 10 * 60_000L) {
         val ahOut: Double,
         val startedAt: Long,
         val samples: Int,
+        val netRate: Double?,         // measured net inflow (A, + = charging) over the long window, null until 20 min
+        val netWindowMin: Int,        // length of that window in minutes
     )
 
+    private data class NetPoint(val t: Long, val net: Double)
+
     private val samples = ArrayDeque<Sample>()
+    private val netPoints = ArrayDeque<NetPoint>()   // cumulative net Ah, kept for LONG_WINDOW_MS
     private var last: Sample? = null
     private var ahIn = 0.0        // charged into the pack
     private var ahOut = 0.0       // drawn from the pack
@@ -40,6 +45,22 @@ class CurrentHistory(private val windowMs: Long = 10 * 60_000L) {
         last = s
         samples.addLast(s)
         while (samples.isNotEmpty() && t - samples.first.t > windowMs) samples.removeFirst()
+        netPoints.addLast(NetPoint(t, ahIn - ahOut))
+        while (netPoints.isNotEmpty() && t - netPoints.first.t > LONG_WINDOW_MS) netPoints.removeFirst()
+    }
+
+    /** Measured net inflow over the long window (the real progress rate, whatever limits it). */
+    private fun netRate(): Pair<Double?, Int> {
+        if (netPoints.size < 2) return null to 0
+        val spanMs = netPoints.last.t - netPoints.first.t
+        val minutes = (spanMs / 60_000L).toInt()
+        if (spanMs < MIN_NET_WINDOW_MS) return null to minutes
+        return (netPoints.last.net - netPoints.first.net) / (spanMs / 3_600_000.0) to minutes
+    }
+
+    companion object {
+        const val LONG_WINDOW_MS = 3 * 60 * 60_000L
+        const val MIN_NET_WINDOW_MS = 20 * 60_000L
     }
 
     /** Time-weighted average current over the window; null until 60 s of data exist. */
@@ -63,11 +84,13 @@ class CurrentHistory(private val windowMs: Long = 10 * 60_000L) {
     fun snapshot(): Stats {
         val chargePeak = samples.filter { it.a < -0.2 }.minOfOrNull { it.a }?.let { -it }
         val dis = samples.filter { it.a > 0.2 }.map { it.a }
+        val (nr, nmin) = netRate()
         return Stats(
             avgCurrent = average(),
             chargeCurrent = chargePeak ?: lastChargeCurrent,
             dischargeCurrent = if (dis.isEmpty()) null else dis.average(),
             ahIn = ahIn, ahOut = ahOut, startedAt = startedAt, samples = samples.size,
+            netRate = nr, netWindowMin = nmin,
         )
     }
 }
@@ -91,14 +114,20 @@ data class ChargeTimeEstimate(
     val secToEmpty: Long?,        // when discharging, lowest cell to 0 %
     val balancerActive: Boolean,
     val assumedCharger: Boolean,  // true when no charger current has been observed yet (3 A assumed)
+    val measuredRate: Double?,    // measured net inflow (A) the estimate is based on; null = model-based
+    val measuredWindowMin: Int,
+    val stalled: Boolean,         // measured net inflow ≈ 0 while charge is still needed
 ) {
     /** BALANCING = charger paused by the high cell while the balancer bleeds it (recovery in progress). */
     enum class Mode { CHARGING, BALANCING, DISCHARGING, IDLE }
 }
 
 object ChargeTimeEstimator {
-    const val BAL_A_LOW = 0.1     // typical passive balancer current range (A)
-    const val BAL_A_HIGH = 0.2
+    // Passive balancer of an ANT BMS, measured on a real unit: ~10 mA effective. Used only until the
+    // app has 20 min of its own measurement; then the measured net inflow decides.
+    const val BAL_A_LOW = 0.01
+    const val BAL_A_HIGH = 0.05
+    const val STALL_A = 0.003
     private const val TAPER = 1.15 // CV taper: the last part of a full charge takes ~15 % longer
 
     fun estimate(s: BmsStatus, soc: SocEstimate, stats: CurrentHistory.Stats): ChargeTimeEstimate {
@@ -129,6 +158,15 @@ object ChargeTimeEstimator {
         }
         val charging = mode == ChargeTimeEstimate.Mode.CHARGING || mode == ChargeTimeEstimate.Mode.BALANCING
         val disA = stats.dischargeCurrent ?: (if (s.isDischarging) s.current else null)
+
+        // Measured progress beats the model: over a long window the net inflow already contains the
+        // charger duty cycle and whatever the balancer really manages (it was ~10 mA on the test pack).
+        val measured = if (charging) stats.netRate else null
+        val stalled = measured != null && measured <= STALL_A && ahToFull > 0.05
+        fun measuredSecs(ah: Double, taper: Double): LongRange? =
+            if (measured == null || measured <= STALL_A) null
+            else (ah / measured * 3600 * taper).toLong().let { it..it }
+        val useMeasured = measured != null
         return ChargeTimeEstimate(
             mode = mode,
             chargeCurrent = chg,
@@ -137,12 +175,16 @@ object ChargeTimeEstimator {
             ahToFull = ahToFull,
             bleedAhTo80 = bleed80,
             bleedAhToFull = bleedFull,
-            secTo80 = if (charging) range(ahTo80, bleed80, 1.0) else null,
-            secToFull = if (charging) range(ahToFull, bleedFull, TAPER) else null,
+            secTo80 = if (!charging) null else if (useMeasured) measuredSecs(ahTo80, 1.0) else range(ahTo80, bleed80, 1.0),
+            secToFull = if (!charging) null else if (useMeasured) measuredSecs(ahToFull, if (bleedFull < 0.05) TAPER else 1.0)
+                        else range(ahToFull, bleedFull, TAPER),
             secToEmpty = if (mode == ChargeTimeEstimate.Mode.DISCHARGING && disA != null && disA > 0.05)
                 (soc.minCellPct / 100.0 * cap / disA * 3600).toLong() else null,
             balancerActive = balancerActive,
             assumedCharger = assumed,
+            measuredRate = measured,
+            measuredWindowMin = stats.netWindowMin,
+            stalled = stalled,
         )
     }
 

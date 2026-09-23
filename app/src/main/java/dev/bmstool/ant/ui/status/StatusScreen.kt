@@ -234,13 +234,23 @@ private fun TimeLine(est: ChargeTimeEstimate?) {
     if (est == null) return
     when (est.mode) {
         ChargeTimeEstimate.Mode.CHARGING, ChargeTimeEstimate.Mode.BALANCING -> Column {
-            Row(verticalAlignment = Alignment.Bottom) {
-                Text("Full in ", fontSize = 13.sp)
-                Text(est.secToFull?.let { ChargeTimeEstimator.duration(it) } ?: "—", fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
-            }
-            if (est.secTo80 != null && est.ahTo80 > 0.01) {
-                Text("80 % in ${ChargeTimeEstimator.duration(est.secTo80)}", fontSize = 11.sp, color = dim())
+            if (est.stalled) {
+                Text("Charging stalled", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Amber)
+                Text("net inflow ≈ 0 over ${est.measuredWindowMin} min", fontSize = 11.sp, color = dim())
+            } else {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text("Full in ", fontSize = 13.sp)
+                    Text(est.secToFull?.let { ChargeTimeEstimator.duration(it) } ?: "—", fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
+                }
+                if (est.secTo80 != null && est.ahTo80 > 0.01) {
+                    Text("80 % in ${ChargeTimeEstimator.duration(est.secTo80)}", fontSize = 11.sp, color = dim())
+                }
+                Text(
+                    if (est.measuredRate != null) "at the measured ${Math.round(est.measuredRate * 1000)} mA net rate (${est.measuredWindowMin} min)"
+                    else "model estimate — measuring, ${est.measuredWindowMin}/20 min",
+                    fontSize = 10.sp, color = dim(),
+                )
             }
         }
         ChargeTimeEstimate.Mode.DISCHARGING -> Row(verticalAlignment = Alignment.Bottom) {
@@ -427,11 +437,24 @@ private fun DetailsSection(
         val dimC = dim()
         if (est != null && (est.mode == ChargeTimeEstimate.Mode.CHARGING || est.mode == ChargeTimeEstimate.Mode.BALANCING)) {
             val chg = est.chargeCurrent?.let { fmt(it, 1) + " A" + (if (est.assumedCharger) " assumed" else "") } ?: "?"
-            lines += if (est.bleedAhToFull >= 0.05)
-                ("Charger ($chg) can add ${fmt(est.directAh, 1)} Ah before #${s.maxCellIndex} is full; the remaining " +
-                    "${fmt(est.bleedAhToFull, 1)} Ah must first be bled from it by the balancer (0.2–0.1 A → time range)" +
+            val unbalanced = est.bleedAhToFull >= 0.05
+            val mr = est.measuredRate
+            val line: Pair<String, Color> = when {
+                mr != null && unbalanced -> {
+                    val head = if (est.stalled) "Stalled: net inflow ≈ 0 over ${est.measuredWindowMin} min. "
+                    else "Measured net inflow ${Math.round(mr * 1000)} mA over ${est.measuredWindowMin} min — with " +
+                        "#${s.maxCellIndex} capping the charge that is the balancer's effective current. "
+                    val tail = "${fmt(est.bleedAhToFull, 1)} Ah of excess on #${s.maxCellIndex} must go before the lowest cell can fill" +
+                        (if (!est.balancerActive) " — BALANCER IS OFF" else "")
+                    (head + tail) to Amber
+                }
+                mr != null -> "Measured net inflow ${fmt(mr, 2)} A over ${est.measuredWindowMin} min, pack balanced" to dimC
+                unbalanced -> ("Model (measuring for ${est.measuredWindowMin}/20 min): charger $chg adds ${fmt(est.directAh, 1)} Ah before " +
+                    "#${s.maxCellIndex} is full; the remaining ${fmt(est.bleedAhToFull, 1)} Ah must be bled by the balancer, assumed 10–50 mA" +
                     (if (!est.balancerActive) " — BALANCER IS OFF, charging will stall" else "")) to Amber
-            else "Charger $chg, pack balanced — plain charge at that current (+15 % taper)" to dimC
+                else -> "Model: charger $chg, pack balanced — plain charge at that current (+15 % taper)" to dimC
+            }
+            lines += line
         }
         lines += ("Power ${s.power} W · runtime ${runtime(s.runtimeSeconds)}") to dimC
         if (soc != null) lines += ("Usable ≈ ${fmt(soc.usableAh, 1)} / ${fmt(s.physicalCapacityAh, 1)} Ah (lowest cell ${soc.minCellPct} %)") to dimC
